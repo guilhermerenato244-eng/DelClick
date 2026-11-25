@@ -1,0 +1,945 @@
+name: Compilar APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Gerar o projeto Android
+        run: |
+          mkdir -p app
+          cat > app/build.gradle <<'__FIM_DO_ARQUIVO__'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+
+          android {
+              namespace 'com.meu.tecladomouse'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.meu.tecladomouse'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              buildFeatures {
+                  aidl true
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+
+          dependencies {
+              implementation 'dev.rikka.shizuku:api:13.1.5'
+              implementation 'dev.rikka.shizuku:provider:13.1.5'
+          }
+          __FIM_DO_ARQUIVO__
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'__FIM_DO_ARQUIVO__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+
+              <queries>
+                  <package android:name="moe.shizuku.privileged.api" />
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Teclado e Mouse Kit"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".OverlayService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="overlay" />
+                  </service>
+
+                  <provider
+                      android:name="rikka.shizuku.ShizukuProvider"
+                      android:authorities="${applicationId}.shizuku"
+                      android:enabled="true"
+                      android:exported="true"
+                      android:multiprocess="false"
+                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+              </application>
+          </manifest>
+          __FIM_DO_ARQUIVO__
+          mkdir -p app/src/main/aidl/com/meu/tecladomouse
+          cat > app/src/main/aidl/com/meu/tecladomouse/IInputService.aidl <<'__FIM_DO_ARQUIVO__'
+          package com.meu.tecladomouse;
+
+          interface IInputService {
+              void destroy() = 16777114;
+              void key(int keyCode, boolean down) = 1;
+              void touch(int action, float x, float y) = 2;
+              void mouseMove(float dx, float dy) = 3;
+              void mouseButton(int button, boolean down) = 4;
+              void setScreen(int w, int h) = 5;
+          }
+          __FIM_DO_ARQUIVO__
+          mkdir -p app/src/main/java/com/meu/tecladomouse
+          cat > app/src/main/java/com/meu/tecladomouse/InputService.kt <<'__FIM_DO_ARQUIVO__'
+          package com.meu.tecladomouse
+
+          import android.os.IBinder
+          import android.os.SystemClock
+          import android.util.Log
+          import android.view.InputDevice
+          import android.view.InputEvent
+          import android.view.KeyCharacterMap
+          import android.view.KeyEvent
+          import android.view.MotionEvent
+          import java.lang.reflect.Method
+          import kotlin.system.exitProcess
+
+          /**
+           * Roda no processo do Shizuku (como "shell"). Injeta teclas, toques e mouse no Android.
+           */
+          class InputService : IInputService.Stub() {
+
+              private var manager: Any? = null
+              private var inject: Method? = null
+
+              private var screenW = 1080f
+              private var screenH = 2400f
+              private var cx = 540f
+              private var cy = 1200f
+              private var touchDownTime = 0L
+              private var mouseDownTime = 0L
+              private var buttons = 0
+
+              init {
+                  try {
+                      val sm = Class.forName("android.os.ServiceManager")
+                      val binder = sm.getMethod("getService", String::class.java).invoke(null, "input") as IBinder
+                      val stub = Class.forName("android.hardware.input.IInputManager\$Stub")
+                      manager = stub.getMethod("asInterface", IBinder::class.java).invoke(null, binder)
+                      val iface = Class.forName("android.hardware.input.IInputManager")
+                      inject = iface.getMethod("injectInputEvent", InputEvent::class.java, Int::class.javaPrimitiveType)
+                  } catch (e: Throwable) {
+                      Log.e("TecladoMouse", "falha ao preparar InputManager", e)
+                  }
+              }
+
+              private fun send(ev: InputEvent) {
+                  try {
+                      inject?.invoke(manager, ev, 0)
+                  } catch (e: Throwable) {
+                      Log.e("TecladoMouse", "falha ao injetar evento", e)
+                  }
+              }
+
+              private fun motion(
+                  downTime: Long,
+                  now: Long,
+                  action: Int,
+                  x: Float,
+                  y: Float,
+                  source: Int,
+                  tool: Int,
+                  buttonState: Int,
+                  pressure: Float,
+                  actionButton: Int = 0
+              ) {
+                  val props = arrayOf(MotionEvent.PointerProperties().apply {
+                      id = 0
+                      toolType = tool
+                  })
+                  val coords = arrayOf(MotionEvent.PointerCoords().apply {
+                      this.x = x
+                      this.y = y
+                      this.pressure = pressure
+                      this.size = 1f
+                  })
+                  val ev = MotionEvent.obtain(
+                      downTime, now, action, 1, props, coords,
+                      0, buttonState, 1f, 1f, 0, 0, source, 0
+                  )
+                  if (actionButton != 0) ev.actionButton = actionButton
+                  send(ev)
+                  ev.recycle()
+              }
+
+              override fun destroy() {
+                  exitProcess(0)
+              }
+
+              override fun setScreen(w: Int, h: Int) {
+                  if (screenW != w.toFloat() || screenH != h.toFloat()) {
+                      screenW = w.toFloat()
+                      screenH = h.toFloat()
+                      cx = screenW / 2f
+                      cy = screenH / 2f
+                  }
+              }
+
+              override fun key(keyCode: Int, down: Boolean) {
+                  val now = SystemClock.uptimeMillis()
+                  val ev = KeyEvent(
+                      now, now,
+                      if (down) KeyEvent.ACTION_DOWN else KeyEvent.ACTION_UP,
+                      keyCode, 0, 0,
+                      KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0,
+                      InputDevice.SOURCE_KEYBOARD
+                  )
+                  send(ev)
+              }
+
+              // action: 0 = apertar, 1 = soltar, 2 = mover
+              override fun touch(action: Int, x: Float, y: Float) {
+                  val now = SystemClock.uptimeMillis()
+                  val act = when (action) {
+                      0 -> MotionEvent.ACTION_DOWN
+                      1 -> MotionEvent.ACTION_UP
+                      else -> MotionEvent.ACTION_MOVE
+                  }
+                  if (action == 0) touchDownTime = now
+                  motion(touchDownTime, now, act, x, y, InputDevice.SOURCE_TOUCHSCREEN, MotionEvent.TOOL_TYPE_FINGER, 0, 1f)
+              }
+
+              override fun mouseMove(dx: Float, dy: Float) {
+                  cx = (cx + dx).coerceIn(0f, screenW - 1f)
+                  cy = (cy + dy).coerceIn(0f, screenH - 1f)
+                  val now = SystemClock.uptimeMillis()
+                  if (buttons != 0) {
+                      motion(mouseDownTime, now, MotionEvent.ACTION_MOVE, cx, cy,
+                          InputDevice.SOURCE_MOUSE, MotionEvent.TOOL_TYPE_MOUSE, buttons, 1f)
+                  } else {
+                      motion(now, now, MotionEvent.ACTION_HOVER_MOVE, cx, cy,
+                          InputDevice.SOURCE_MOUSE, MotionEvent.TOOL_TYPE_MOUSE, 0, 0f)
+                  }
+              }
+
+              // button: 1 = esquerdo, 2 = direito
+              override fun mouseButton(button: Int, down: Boolean) {
+                  val mask = if (button == 2) MotionEvent.BUTTON_SECONDARY else MotionEvent.BUTTON_PRIMARY
+                  val now = SystemClock.uptimeMillis()
+                  if (down) {
+                      val before = buttons
+                      if (before == 0) mouseDownTime = now
+                      buttons = buttons or mask
+                      if (before == 0) {
+                          motion(mouseDownTime, now, MotionEvent.ACTION_DOWN, cx, cy,
+                              InputDevice.SOURCE_MOUSE, MotionEvent.TOOL_TYPE_MOUSE, buttons, 1f)
+                      }
+                      motion(mouseDownTime, now, MotionEvent.ACTION_BUTTON_PRESS, cx, cy,
+                          InputDevice.SOURCE_MOUSE, MotionEvent.TOOL_TYPE_MOUSE, buttons, 1f, mask)
+                  } else {
+                      buttons = buttons and mask.inv()
+                      motion(mouseDownTime, now, MotionEvent.ACTION_BUTTON_RELEASE, cx, cy,
+                          InputDevice.SOURCE_MOUSE, MotionEvent.TOOL_TYPE_MOUSE, buttons, 1f, mask)
+                      if (buttons == 0) {
+                          motion(mouseDownTime, now, MotionEvent.ACTION_UP, cx, cy,
+                              InputDevice.SOURCE_MOUSE, MotionEvent.TOOL_TYPE_MOUSE, 0, 0f)
+                      }
+                  }
+              }
+          }
+          __FIM_DO_ARQUIVO__
+          mkdir -p app/src/main/java/com/meu/tecladomouse
+          cat > app/src/main/java/com/meu/tecladomouse/MainActivity.kt <<'__FIM_DO_ARQUIVO__'
+          package com.meu.tecladomouse
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import rikka.shizuku.Shizuku
+
+          class MainActivity : Activity() {
+
+              private lateinit var status: TextView
+              private val reqCode = 4242
+
+              private val permListener = Shizuku.OnRequestPermissionResultListener { _, _ ->
+                  runOnUiThread { refresh() }
+              }
+              private val binderListener = Shizuku.OnBinderReceivedListener {
+                  runOnUiThread { refresh() }
+              }
+              private val deadListener = Shizuku.OnBinderDeadListener {
+                  runOnUiThread { refresh() }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = dp(20)
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(pad, pad, pad, pad)
+                  root.setBackgroundColor(Color.parseColor("#161228"))
+
+                  root.addView(label("Teclado e Mouse Kit", 22f, true))
+                  status = label("", 15f, false)
+                  root.addView(status)
+                  root.addView(button("1. Permitir sobreposição (aparecer sobre o Roblox)") { openOverlaySettings() })
+                  root.addView(button("2. Abrir o Shizuku") { openShizuku() })
+                  root.addView(button("3. Dar permissão do Shizuku ao app") { askShizuku() })
+                  root.addView(button("4. Iniciar painel") { startPanel() })
+                  root.addView(button("Parar painel") { stopService(Intent(this, OverlayService::class.java)) })
+
+                  val scroll = ScrollView(this)
+                  scroll.setBackgroundColor(Color.parseColor("#161228"))
+                  scroll.addView(root)
+                  setContentView(scroll)
+
+                  Shizuku.addBinderReceivedListenerSticky(binderListener)
+                  Shizuku.addBinderDeadListener(deadListener)
+                  Shizuku.addRequestPermissionResultListener(permListener)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refresh()
+              }
+
+              override fun onDestroy() {
+                  Shizuku.removeBinderReceivedListener(binderListener)
+                  Shizuku.removeBinderDeadListener(deadListener)
+                  Shizuku.removeRequestPermissionResultListener(permListener)
+                  super.onDestroy()
+              }
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              private fun label(text: String, size: Float, bold: Boolean): TextView {
+                  val t = TextView(this)
+                  t.text = text
+                  t.textSize = size
+                  t.setTextColor(Color.WHITE)
+                  if (bold) t.typeface = Typeface.DEFAULT_BOLD
+                  t.setPadding(0, dp(6), 0, dp(12))
+                  return t
+              }
+
+              private fun button(text: String, onClick: () -> Unit): Button {
+                  val b = Button(this)
+                  b.text = text
+                  b.isAllCaps = false
+                  b.setOnClickListener { onClick() }
+                  return b
+              }
+
+              private fun toast(msg: String) {
+                  Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+              }
+
+              private fun shizukuRunning(): Boolean = Shizuku.pingBinder()
+
+              private fun shizukuGranted(): Boolean =
+                  shizukuRunning() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+
+              private fun refresh() {
+                  val overlay = if (Settings.canDrawOverlays(this)) "OK" else "falta permitir"
+                  val shizuku = when {
+                      !shizukuRunning() -> "não está rodando (abra o Shizuku e inicie)"
+                      shizukuGranted() -> "OK"
+                      else -> "rodando, falta dar permissão ao app"
+                  }
+                  status.text = "Sobreposição: $overlay\nShizuku: $shizuku"
+              }
+
+              private fun openOverlaySettings() {
+                  val i = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+                  startActivity(i)
+              }
+
+              private fun openShizuku() {
+                  val i = packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")
+                  if (i != null) startActivity(i) else toast("Shizuku não está instalado")
+              }
+
+              private fun askShizuku() {
+                  when {
+                      !shizukuRunning() -> toast("Abra o Shizuku e inicie ele primeiro")
+                      shizukuGranted() -> toast("A permissão já está concedida")
+                      else -> Shizuku.requestPermission(reqCode)
+                  }
+              }
+
+              private fun startPanel() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      toast("Permita a sobreposição primeiro (botão 1)")
+                      return
+                  }
+                  if (!shizukuGranted()) {
+                      toast("Sem permissão do Shizuku o painel aparece, mas não envia teclas")
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+                  startForegroundService(Intent(this, OverlayService::class.java))
+                  toast("Painel iniciado. Abra o Roblox e toque na bolinha KB")
+              }
+          }
+          __FIM_DO_ARQUIVO__
+          mkdir -p app/src/main/java/com/meu/tecladomouse
+          cat > app/src/main/java/com/meu/tecladomouse/OverlayService.kt <<'__FIM_DO_ARQUIVO__'
+          package com.meu.tecladomouse
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.content.ServiceConnection
+          import android.content.pm.PackageManager
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
+          import android.os.IBinder
+          import android.util.DisplayMetrics
+          import android.view.Gravity
+          import android.view.KeyEvent
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.LinearLayout
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import android.widget.Toast
+          import kotlin.math.abs
+          import rikka.shizuku.Shizuku
+
+          class OverlayService : Service() {
+
+              private class K(val label: String, val code: Int, val w: Float)
+
+              private lateinit var wm: WindowManager
+              private var bubble: View? = null
+              private var panel: View? = null
+              private var bubbleParams: WindowManager.LayoutParams? = null
+              private var panelParams: WindowManager.LayoutParams? = null
+
+              private var input: IInputService? = null
+              private var userArgs: Shizuku.UserServiceArgs? = null
+
+              private var cameraMode = true
+              private var sens = 1.6f
+              private var camX = 0f
+              private var camY = 0f
+              private var lastX = 0f
+              private var lastY = 0f
+
+              private val conn = object : ServiceConnection {
+                  override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+                      input = IInputService.Stub.asInterface(binder)
+                      pushScreen()
+                  }
+
+                  override fun onServiceDisconnected(name: ComponentName?) {
+                      input = null
+                  }
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_NOT_STICKY
+
+              override fun onCreate() {
+                  super.onCreate()
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  startAsForeground()
+                  buildBubble()
+                  bindShizuku()
+              }
+
+              override fun onDestroy() {
+                  safe { bubble?.let { wm.removeView(it) } }
+                  safe { panel?.let { wm.removeView(it) } }
+                  safe { userArgs?.let { Shizuku.unbindUserService(it, conn, true) } }
+                  super.onDestroy()
+              }
+
+              // ------------------------------------------------------------ utilidades
+
+              private inline fun safe(block: () -> Unit) {
+                  try {
+                      block()
+                  } catch (e: Throwable) {
+                  }
+              }
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              @Suppress("DEPRECATION")
+              private fun screen(): DisplayMetrics {
+                  val dm = DisplayMetrics()
+                  wm.defaultDisplay.getRealMetrics(dm)
+                  return dm
+              }
+
+              private fun pushScreen() {
+                  val dm = screen()
+                  safe { input?.setScreen(dm.widthPixels, dm.heightPixels) }
+              }
+
+              private fun toast(msg: String) {
+                  Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+              }
+
+              private fun rounded(color: Int, r: Int, stroke: Int? = null): GradientDrawable {
+                  val d = GradientDrawable()
+                  d.setColor(color)
+                  d.cornerRadius = r.toFloat()
+                  if (stroke != null) d.setStroke(dp(1), stroke)
+                  return d
+              }
+
+              private fun overlayParams(w: Int, h: Int): WindowManager.LayoutParams {
+                  val lp = WindowManager.LayoutParams(
+                      w, h,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  return lp
+              }
+
+              private fun startAsForeground() {
+                  val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                  nm.createNotificationChannel(
+                      NotificationChannel("painel", "Painel", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val n = Notification.Builder(this, "painel")
+                      .setContentTitle("Teclado e Mouse Kit ativo")
+                      .setContentText("Toque na bolinha KB para abrir o painel")
+                      .setSmallIcon(android.R.drawable.ic_dialog_info)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  } else {
+                      startForeground(1, n)
+                  }
+              }
+
+              private fun bindShizuku() {
+                  if (!Shizuku.pingBinder()) {
+                      toast("Shizuku não está rodando")
+                      return
+                  }
+                  if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+                      toast("Falta a permissão do Shizuku (botão 3 no app)")
+                      return
+                  }
+                  val args = Shizuku.UserServiceArgs(ComponentName(packageName, InputService::class.java.name))
+                      .daemon(false)
+                      .processNameSuffix("input")
+                      .debuggable(false)
+                      .version(1)
+                  userArgs = args
+                  Shizuku.bindUserService(args, conn)
+              }
+
+              private fun sendKey(code: Int, down: Boolean) {
+                  safe { input?.key(code, down) }
+              }
+
+              // ------------------------------------------------------------ bolinha
+
+              private fun buildBubble() {
+                  val v = TextView(this)
+                  v.text = "KB"
+                  v.gravity = Gravity.CENTER
+                  v.setTextColor(Color.WHITE)
+                  v.textSize = 14f
+                  v.typeface = Typeface.DEFAULT_BOLD
+                  val d = GradientDrawable()
+                  d.shape = GradientDrawable.OVAL
+                  d.setColor(0xE67C5CFF.toInt())
+                  v.background = d
+
+                  val lp = overlayParams(dp(48), dp(48))
+                  lp.x = dp(8)
+                  lp.y = dp(120)
+                  bubbleParams = lp
+                  makeDraggable(v, v, lp) { togglePanel() }
+                  wm.addView(v, lp)
+                  bubble = v
+              }
+
+              private fun makeDraggable(
+                  handle: View,
+                  target: View,
+                  lp: WindowManager.LayoutParams,
+                  onClick: (() -> Unit)?
+              ) {
+                  var sx = 0f
+                  var sy = 0f
+                  var ox = 0
+                  var oy = 0
+                  var moved = false
+                  handle.setOnTouchListener { _, ev ->
+                      when (ev.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> {
+                              sx = ev.rawX
+                              sy = ev.rawY
+                              ox = lp.x
+                              oy = lp.y
+                              moved = false
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = ev.rawX - sx
+                              val dy = ev.rawY - sy
+                              if (abs(dx) > dp(4) || abs(dy) > dp(4)) moved = true
+                              if (moved) {
+                                  lp.x = ox + dx.toInt()
+                                  lp.y = oy + dy.toInt()
+                                  wm.updateViewLayout(target, lp)
+                              }
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              if (!moved) onClick?.invoke()
+                          }
+                      }
+                      true
+                  }
+              }
+
+              // ------------------------------------------------------------ painel
+
+              private fun togglePanel() {
+                  if (panel != null) hidePanel() else showPanel()
+              }
+
+              private fun hidePanel() {
+                  safe { panel?.let { wm.removeView(it) } }
+                  panel = null
+              }
+
+              private fun showPanel() {
+                  val dm = screen()
+                  pushScreen()
+                  val w = (dm.widthPixels * 0.60f).toInt()
+                  val lp = overlayParams(w, WindowManager.LayoutParams.WRAP_CONTENT)
+                  lp.x = (dm.widthPixels - w) / 2
+                  lp.y = (dm.heightPixels * 0.38f).toInt()
+                  panelParams = lp
+                  val view = buildPanel(lp)
+                  wm.addView(view, lp)
+                  panel = view
+              }
+
+              private fun textBox(text: String, size: Float, color: Int, bg: Int): TextView {
+                  val t = TextView(this)
+                  t.text = text
+                  t.gravity = Gravity.CENTER
+                  t.setTextColor(color)
+                  t.textSize = size
+                  t.background = rounded(bg, dp(6))
+                  return t
+              }
+
+              private fun keyView(label: String, code: Int): TextView {
+                  val keyColor = 0xFF20202A.toInt()
+                  val keyOn = 0xFF563CAA.toInt()
+                  val t = textBox(label, 11f, 0xFFD7D7E6.toInt(), keyColor)
+                  t.setOnTouchListener { v, ev ->
+                      when (ev.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> {
+                              v.background = rounded(keyOn, dp(6), 0xFF7C5CFF.toInt())
+                              sendKey(code, true)
+                          }
+                          MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                              v.background = rounded(keyColor, dp(6))
+                              sendKey(code, false)
+                          }
+                      }
+                      true
+                  }
+                  return t
+              }
+
+              private fun k(label: String, code: Int, w: Float = 1.1f) = K(label, code, w)
+
+              private fun sp(w: Float) = K("", -1, w)
+
+              private fun keyRow(vararg items: K): LinearLayout {
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  row.weightSum = 9.0f
+                  for (item in items) {
+                      val lp = LinearLayout.LayoutParams(0, dp(34), item.w)
+                      lp.setMargins(dp(1), dp(1), dp(1), dp(1))
+                      if (item.code < 0) {
+                          row.addView(View(this), lp)
+                      } else {
+                          row.addView(keyView(item.label, item.code), lp)
+                      }
+                  }
+                  return row
+              }
+
+              private fun mouseButtonView(label: String, button: Int): TextView {
+                  val base = 0xFF6E4CDC.toInt()
+                  val on = 0xFFA58BFF.toInt()
+                  val t = textBox(label, 12f, Color.WHITE, base)
+                  t.setOnTouchListener { v, ev ->
+                      when (ev.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> {
+                              v.background = rounded(on, dp(10))
+                              safe { input?.mouseButton(button, true) }
+                          }
+                          MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                              v.background = rounded(base, dp(10))
+                              safe { input?.mouseButton(button, false) }
+                          }
+                      }
+                      true
+                  }
+                  t.background = rounded(base, dp(10))
+                  return t
+              }
+
+              private fun padTouch(ev: MotionEvent): Boolean {
+                  val dm = screen()
+                  val w = dm.widthPixels.toFloat()
+                  val h = dm.heightPixels.toFloat()
+                  val anchorX = w * 0.91f
+                  val anchorY = h * 0.25f
+                  when (ev.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          lastX = ev.rawX
+                          lastY = ev.rawY
+                          if (cameraMode) {
+                              camX = anchorX
+                              camY = anchorY
+                              safe { input?.touch(0, camX, camY) }
+                          }
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          val dx = (ev.rawX - lastX) * sens
+                          val dy = (ev.rawY - lastY) * sens
+                          lastX = ev.rawX
+                          lastY = ev.rawY
+                          if (cameraMode) {
+                              val nx = camX + dx
+                              val ny = camY + dy
+                              if (nx < w * 0.84f || nx > w * 0.98f || ny < h * 0.10f || ny > h * 0.36f) {
+                                  safe { input?.touch(1, camX, camY) }
+                                  camX = anchorX
+                                  camY = anchorY
+                                  safe { input?.touch(0, camX, camY) }
+                              } else {
+                                  camX = nx
+                                  camY = ny
+                                  safe { input?.touch(2, camX, camY) }
+                              }
+                          } else {
+                              safe { input?.mouseMove(dx, dy) }
+                          }
+                      }
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                          if (cameraMode) safe { input?.touch(1, camX, camY) }
+                      }
+                  }
+                  return true
+              }
+
+              private fun buildPanel(lp: WindowManager.LayoutParams): View {
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.background = rounded(0xF2161228.toInt(), dp(18), 0xFF3E3470.toInt())
+                  root.setPadding(dp(10), dp(6), dp(10), dp(10))
+
+                  // cabeçalho (arraste pelo título)
+                  val header = LinearLayout(this)
+                  header.orientation = LinearLayout.HORIZONTAL
+                  header.gravity = Gravity.CENTER_VERTICAL
+                  val title = TextView(this)
+                  title.text = "Teclado na tela  (arraste aqui)"
+                  title.setTextColor(Color.WHITE)
+                  title.textSize = 13f
+                  title.typeface = Typeface.DEFAULT_BOLD
+                  header.addView(title, LinearLayout.LayoutParams(0, dp(32), 1f))
+                  val close = textBox("X", 14f, Color.WHITE, 0xFF34283F.toInt())
+                  close.setOnClickListener { hidePanel() }
+                  header.addView(close, LinearLayout.LayoutParams(dp(36), dp(28)))
+                  root.addView(header)
+                  makeDraggable(title, root, lp, null)
+
+                  val bodyRow = LinearLayout(this)
+                  bodyRow.orientation = LinearLayout.HORIZONTAL
+
+                  // teclado
+                  val kbd = LinearLayout(this)
+                  kbd.orientation = LinearLayout.VERTICAL
+                  kbd.addView(keyRow(
+                      sp(1.7f),
+                      k("1", KeyEvent.KEYCODE_1), k("2", KeyEvent.KEYCODE_2), k("3", KeyEvent.KEYCODE_3),
+                      k("4", KeyEvent.KEYCODE_4), k("5", KeyEvent.KEYCODE_5)
+                  ))
+                  kbd.addView(keyRow(
+                      k("tab", KeyEvent.KEYCODE_TAB, 1.6f),
+                      k("q", KeyEvent.KEYCODE_Q), k("w", KeyEvent.KEYCODE_W), k("e", KeyEvent.KEYCODE_E),
+                      k("r", KeyEvent.KEYCODE_R), k("t", KeyEvent.KEYCODE_T)
+                  ))
+                  kbd.addView(keyRow(
+                      k("caps", KeyEvent.KEYCODE_CAPS_LOCK, 1.8f),
+                      k("a", KeyEvent.KEYCODE_A), k("s", KeyEvent.KEYCODE_S), k("d", KeyEvent.KEYCODE_D),
+                      k("f", KeyEvent.KEYCODE_F), k("g", KeyEvent.KEYCODE_G)
+                  ))
+                  kbd.addView(keyRow(
+                      k("shift", KeyEvent.KEYCODE_SHIFT_LEFT, 2.3f),
+                      k("z", KeyEvent.KEYCODE_Z), k("x", KeyEvent.KEYCODE_X),
+                      k("c", KeyEvent.KEYCODE_C), k("v", KeyEvent.KEYCODE_V)
+                  ))
+                  kbd.addView(keyRow(
+                      k("ctrl", KeyEvent.KEYCODE_CTRL_LEFT, 1.5f),
+                      k("alt", KeyEvent.KEYCODE_ALT_LEFT, 1.1f),
+                      k("", KeyEvent.KEYCODE_SPACE, 6.0f)
+                  ))
+                  bodyRow.addView(kbd, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 7f))
+
+                  // mouse
+                  val mouse = LinearLayout(this)
+                  mouse.orientation = LinearLayout.VERTICAL
+                  mouse.setPadding(dp(6), 0, 0, 0)
+                  val buttonsRow = LinearLayout(this)
+                  buttonsRow.orientation = LinearLayout.HORIZONTAL
+                  val bl = LinearLayout.LayoutParams(0, dp(46), 1f)
+                  bl.setMargins(dp(1), dp(1), dp(1), dp(1))
+                  buttonsRow.addView(mouseButtonView("Esq", 1), bl)
+                  buttonsRow.addView(mouseButtonView("Dir", 2), bl)
+                  mouse.addView(buttonsRow)
+
+                  val pad = textBox("arraste aqui", 11f, 0xFFB9ADE8.toInt(), 0xFF100E20.toInt())
+                  pad.background = rounded(0xFF100E20.toInt(), dp(10), 0xFF3E3470.toInt())
+                  pad.setOnTouchListener { _, ev -> padTouch(ev) }
+                  val pl = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(64))
+                  pl.setMargins(dp(1), dp(4), dp(1), dp(4))
+                  mouse.addView(pad, pl)
+
+                  val mode = textBox("Modo: Câmera", 11f, Color.WHITE, 0xFF34283F.toInt())
+                  mode.setOnClickListener {
+                      cameraMode = !cameraMode
+                      mode.text = if (cameraMode) "Modo: Câmera" else "Modo: Mouse"
+                  }
+                  mouse.addView(mode, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(26)))
+                  bodyRow.addView(mouse, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 3f))
+                  root.addView(bodyRow)
+
+                  // sensibilidade
+                  val sensLabel = TextView(this)
+                  sensLabel.text = "Sensibilidade"
+                  sensLabel.setTextColor(0xFFB9ADE8.toInt())
+                  sensLabel.textSize = 11f
+                  root.addView(sensLabel)
+                  val seek = SeekBar(this)
+                  seek.max = 100
+                  seek.progress = 31
+                  seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                          sens = 0.5f + p / 100f * 3.5f
+                      }
+
+                      override fun onStartTrackingTouch(s: SeekBar?) {}
+
+                      override fun onStopTrackingTouch(s: SeekBar?) {}
+                  })
+                  root.addView(seek)
+                  return root
+              }
+          }
+          __FIM_DO_ARQUIVO__
+          cat > build.gradle <<'__FIM_DO_ARQUIVO__'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          __FIM_DO_ARQUIVO__
+          cat > gradle.properties <<'__FIM_DO_ARQUIVO__'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          __FIM_DO_ARQUIVO__
+          cat > settings.gradle <<'__FIM_DO_ARQUIVO__'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "TecladoMouseKit"
+          include ":app"
+          __FIM_DO_ARQUIVO__
+
+      - name: Compilar o APK
+        run: gradle assembleDebug --stacktrace
+
+      - name: Guardar o APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: TecladoMouseKit-apk
+          path: app/build/outputs/apk/debug/*.apk
