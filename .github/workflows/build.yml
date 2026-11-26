@@ -198,7 +198,17 @@ jobs:
                       downTime, now, action, 1, props, coords,
                       0, buttonState, 1f, 1f, 0, 0, source, 0
                   )
-                  if (actionButton != 0) ev.actionButton = actionButton
+                  if (actionButton != 0) {
+                      // O Android expõe actionButton como propriedade somente leitura em Kotlin.
+                      // Usa reflexão para preencher o campo quando a API do dispositivo permite.
+                      try {
+                          MotionEvent::class.java
+                              .getMethod("setActionButton", Int::class.javaPrimitiveType)
+                              .invoke(ev, actionButton)
+                      } catch (_: Throwable) {
+                          Log.w("TecladoMouse", "Não foi possível definir actionButton")
+                      }
+                  }
                   send(ev)
                   ev.recycle()
               }
@@ -463,16 +473,4 @@ jobs:
 
           class OverlayService : Service() {
 
-              private class K(val label: String, val code: Int, val w: Float)
-
-              private lateinit var wm: WindowManager
-              private var bubble: View? = null
-              private var panel: View? = null
-              private var bubbleParams: WindowManager.LayoutParams? = null
-              private var panelParams: WindowManager.LayoutParams? = null
-
-              private var input: IInputService? = null
-              private var userArgs: Shizuku.UserServiceArgs? = null
-
-              private var cameraMode = true
-              private var sens = 1
+      
